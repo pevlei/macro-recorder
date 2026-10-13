@@ -741,7 +741,7 @@ class MacroService : AccessibilityService() {
         var cur = -1
         var max = -1
         var toast = false
-        val re = Regex("^(\\d{1,2})\\s*/\\s*(\\d{1,2})$")
+        val re = Regex("(\\d{1,2})\\s*/\\s*(\\d{1,2})")
         for (b in t.textBlocks) {
             for (l in b.lines) {
                 val s = l.text.trim()
@@ -868,10 +868,24 @@ class MacroService : AccessibilityService() {
         }
     }
 
-    private fun mapVisible(sc: Screen): Boolean = mapWords.count { sc.has(it) } >= 2
+    // peta terdeteksi dari menu bawah (kalau terbuka) ATAU dari teks koordinat X:... Y:... di kiri atas
+    private fun mapVisible(sc: Screen): Boolean {
+        if (mapWords.count { sc.has(it) } >= 2) return true
+        val rx = Regex("(?i)\\bx\\s*:\\s*\\d{2,4}")
+        val ry = Regex("(?i)\\by\\s*:\\s*\\d{2,4}")
+        var fx = false
+        var fy = false
+        for (l in sc.lines) {
+            if (l.cy < sc.h * 0.15f && l.cx < sc.w * 0.6f) {
+                if (rx.containsMatchIn(l.text)) fx = true
+                if (ry.containsMatchIn(l.text)) fy = true
+            }
+        }
+        return fx && fy
+    }
 
     private fun counterOf(sc: Screen): Pair<Int, Int>? {
-        val re = Regex("^(\\d{1,2})\\s*/\\s*(\\d{1,2})$")
+        val re = Regex("(\\d{1,2})\\s*/\\s*(\\d{1,2})")
         for (l in sc.lines) {
             if (l.cx > sc.w * 0.8f && l.cy < sc.h * 0.4f) {
                 val m = re.find(l.text)
@@ -1059,17 +1073,28 @@ class MacroService : AccessibilityService() {
                 tapPx(ln.cx, ln.cy) { bfSchedule(1500) }
             }
             Bf.TROOPS -> {
-                if (!sc.has("BERGERAK") && !sc.has("March")) {
-                    if (bfTries++ >= 8) {
-                        bfFail("Layar pasukan tidak muncul", sc)
-                    } else {
-                        bfSchedule(1000)
-                    }
+                // layar pilih pasukan sudah terbuka -> pilih slot
+                if (sc.has("BERGERAK") || sc.has("March")) {
+                    bf = Bf.GO
+                    bfTries = 0
+                    tapFrac(sc, 0.7899f, bfSlotY[bfSlot - 1]) { bfSchedule(900) }
                     return
                 }
-                bf = Bf.GO
-                bfTries = 0
-                tapFrac(sc, 0.7899f, bfSlotY[bfSlot - 1]) { bfSchedule(900) }
+                // setelah RALLY: tap tombol "Pasukan Baru" di panel antrean kanan atas
+                val nb = sc.exactAny("Pasukan Baru", "Pasukan", "New Troops")
+                if (nb != null) {
+                    tapPx(nb.cx, nb.cy) { bfSchedule(1500) }
+                    return
+                }
+                if (sc.has("dari kotamu")) {
+                    tapFrac(sc, 0.8024f, 0.2f) { bfSchedule(1500) }
+                    return
+                }
+                if (bfTries++ >= 8) {
+                    bfFail("Layar pasukan tidak muncul", sc)
+                } else {
+                    bfSchedule(1000)
+                }
             }
             Bf.GO -> {
                 val ln = sc.find("BERGERAK")
