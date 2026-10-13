@@ -4,12 +4,15 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -18,26 +21,39 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
 
 class MacroService : AccessibilityService() {
 
-    private class Step(val delay: Long, val duration: Long, val points: List<FloatArray>)
+    // kind 0 = gesture, kind 1 = penanda level (points[0] = tombol -, points[1] = tombol +)
+    private class Step(val kind: Int, val delay: Long, val duration: Long, val points: List<FloatArray>)
 
-    private enum class Mode { IDLE, RECORDING, PLAYING }
+    private class Slot(val name: String) {
+        val steps = ArrayList<Step>()
+        var level = 4
+    }
 
+    private class Scan(val cur: Int, val max: Int, val toast: Boolean)
+
+    private enum class Mode { IDLE, PICK, RECORDING, PLAYING }
+
+    private val slots = listOf("Barbar Fort", "Food", "Wood", "Stone", "Gold", "Gems").map { Slot(it) }
     private val speeds = floatArrayOf(0.5f, 1f, 2f, 3f)
-    private val loops = intArrayOf(1, 3, 5, 10, 0) // 0 = tanpa batas
 
     private lateinit var wm: WindowManager
     private lateinit var prefs: SharedPreferences
     private val handler = Handler(Looper.getMainLooper())
 
-    private val steps = ArrayList<Step>()
     private var mode = Mode.IDLE
+    private var note: String? = null
     private var speedIdx = 1
-    private var loopIdx = 0
+    private var autoSlot = -1 // -1 = mati
+    private var paused = false
 
     // panel
     private lateinit var panelRoot: LinearLayout
@@ -45,52 +61,70 @@ class MacroService : AccessibilityService() {
     private lateinit var status: TextView
     private lateinit var btnRec: TextView
     private lateinit var btnStop: TextView
-    private lateinit var btnPlay: TextView
+    private lateinit var btnPause: TextView
     private lateinit var btnSet: TextView
+    private lateinit var btnLevel: TextView
+    private lateinit var slotBox: LinearLayout
+    private val slotChips = ArrayList<TextView>()
     private lateinit var settingsBox: LinearLayout
+    private lateinit var btnAuto: TextView
     private lateinit var btnSpeed: TextView
-    private lateinit var btnLoop: TextView
     private lateinit var btnClear: TextView
 
     // rekam
+    private var recSlot = 0
     private var captureView: View? = null
     private var captureParams: WindowManager.LayoutParams? = null
     private var curPoints: MutableList<FloatArray>? = null
     private var downTime = 0L
     private var curDelay = 0L
     private var lastUp = 0L
+    private var levelPending = 0
+    private var levelDelay = 0L
+    private val levelPts = ArrayList<FloatArray>()
 
     // putar
-    private var token = 0
+    private val queue = ArrayList<Int>()
+    private var runSlot = 0
+    private var runSteps: List<Step> = emptyList()
     private var stepIdx = 0
-    private var loopsDone = 0
+    private var token = 0
+    private var lastRunEnd = 0L
+
+    // OCR
+    private val ocrSupported = Build.VERSION.SDK_INT >= 30
+    private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    private var scanning = false
+    private var autoRuns = 0
+    private val scanTask = Runnable { doScan() }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("macro", Context.MODE_PRIVATE)
         speedIdx = prefs.getInt("speed", 1).coerceIn(0, speeds.size - 1)
-        loopIdx = prefs.getInt("loop", 0).coerceIn(0, loops.size - 1)
-        loadSteps()
+        autoSlot = prefs.getInt("auto", -1).coerceIn(-1, slots.size - 1)
+        loadAll()
         buildPanel()
         refreshUi()
+        scheduleScan()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {
-        stopAll()
+        stopAll(false)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         if (::wm.isInitialized) {
-            stopAll()
+            stopAll(false)
             try { wm.removeView(panelRoot) } catch (e: Exception) {}
         }
     }
 
-    // ---------- UI panel ----------
+    // ---------- Panel ----------
 
     private fun dp(n: Int): Int = (n * resources.displayMetrics.density).toInt()
 
@@ -131,41 +165,69 @@ class MacroService : AccessibilityService() {
 
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
-        btnRec = chip("● Rec", 0xFFD93025.toInt()) { startRecording() }
-        btnStop = chip("■ Stop", 0xFF5F6368.toInt()) { stopAll() }
-        btnPlay = chip("▶ Play", 0xFF188038.toInt()) { startPlayback() }
+        btnRec = chip("● Rec", 0xFFD93025.toInt()) { onRecButton() }
+        btnStop = chip("■ Stop", 0xFF5F6368.toInt()) { stopAll(true) }
+        btnPause = chip("⏸ Jeda", 0xFF9A6B00.toInt()) { togglePause() }
         btnSet = chip("⚙", 0xFF3C4043.toInt()) {
             settingsBox.visibility =
                 if (settingsBox.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
         row.addView(btnRec)
         row.addView(btnStop)
-        row.addView(btnPlay)
+        row.addView(btnPause)
         row.addView(btnSet)
         panelRoot.addView(row)
+
+        btnLevel = chip("＋Level (tap − lalu +)", 0xFF1A73E8.toInt()) {
+            if (mode == Mode.RECORDING && levelPending == 0) {
+                levelPending = 2
+                levelPts.clear()
+                note = "Tap tombol − dulu"
+                refreshUi()
+            }
+        }
+        btnLevel.visibility = View.GONE
+        panelRoot.addView(btnLevel)
+
+        slotBox = LinearLayout(this)
+        slotBox.orientation = LinearLayout.VERTICAL
+        var rowL: LinearLayout? = null
+        for (i in slots.indices) {
+            if (i % 3 == 0) {
+                rowL = LinearLayout(this)
+                rowL.orientation = LinearLayout.HORIZONTAL
+                slotBox.addView(rowL)
+            }
+            val c = chip("", 0xFF2D5BA8.toInt()) { onChip(i) }
+            c.textSize = 12f
+            c.setPadding(dp(8), dp(8), dp(8), dp(8))
+            c.setOnLongClickListener {
+                cycleLevel(i)
+                true
+            }
+            slotChips.add(c)
+            rowL!!.addView(c)
+        }
+        panelRoot.addView(slotBox)
 
         settingsBox = LinearLayout(this)
         settingsBox.orientation = LinearLayout.VERTICAL
         settingsBox.visibility = View.GONE
+        btnAuto = chip("", 0xFF3C4043.toInt()) { cycleAuto() }
         btnSpeed = chip("", 0xFF3C4043.toInt()) {
             speedIdx = (speedIdx + 1) % speeds.size
             prefs.edit().putInt("speed", speedIdx).apply()
             refreshUi()
         }
-        btnLoop = chip("", 0xFF3C4043.toInt()) {
-            loopIdx = (loopIdx + 1) % loops.size
-            prefs.edit().putInt("loop", loopIdx).apply()
-            refreshUi()
-        }
-        btnClear = chip("Hapus rekaman", 0xFF8C1D18.toInt()) {
+        btnClear = chip("Hapus semua rekaman", 0xFF8C1D18.toInt()) {
             if (mode == Mode.IDLE) {
-                steps.clear()
-                saveSteps()
+                for (s in slots) s.steps.clear()
+                saveAll()
                 refreshUi()
             }
         }
+        settingsBox.addView(btnAuto)
         settingsBox.addView(btnSpeed)
-        settingsBox.addView(btnLoop)
         settingsBox.addView(btnClear)
         panelRoot.addView(settingsBox)
 
@@ -205,39 +267,102 @@ class MacroService : AccessibilityService() {
         wm.addView(panelRoot, panelParams)
     }
 
-    private fun loopLabel(): String = if (loops[loopIdx] == 0) "∞" else loops[loopIdx].toString()
-
     private fun refreshUi() {
-        val playing = mode == Mode.PLAYING
         val idle = mode == Mode.IDLE
-        val vis = if (playing) View.GONE else View.VISIBLE
-        btnRec.visibility = vis
-        btnPlay.visibility = vis
-        btnSet.visibility = vis
-        if (playing) settingsBox.visibility = View.GONE
-        btnRec.alpha = if (idle) 1f else 0.4f
-        btnPlay.alpha = if (idle) 1f else 0.4f
-        btnStop.alpha = if (idle) 0.4f else 1f
-        status.text = when (mode) {
-            Mode.IDLE -> "Macro (Beta) · ${steps.size} langkah"
-            Mode.RECORDING -> "● Merekam · ${steps.size} langkah"
-            Mode.PLAYING -> "▶ Putaran ${loopsDone + 1}/${loopLabel()}"
+        val playing = mode == Mode.PLAYING
+        val rec = mode == Mode.RECORDING
+        btnRec.visibility = if (playing || rec) View.GONE else View.VISIBLE
+        btnSet.visibility = if (playing || rec) View.GONE else View.VISIBLE
+        btnPause.visibility = if (rec) View.GONE else View.VISIBLE
+        slotBox.visibility = if (playing || rec) View.GONE else View.VISIBLE
+        btnLevel.visibility = if (rec) View.VISIBLE else View.GONE
+        if (playing || rec) settingsBox.visibility = View.GONE
+        btnRec.text = if (mode == Mode.PICK) "✕ Batal" else "● Rec"
+        btnStop.alpha = if (idle && !paused) 0.4f else 1f
+        btnPause.text = if (paused) "▶ Lanjut" else "⏸ Jeda"
+        for (i in slots.indices) {
+            val s = slots[i]
+            slotChips[i].text = "${s.name} L${s.level}"
+            slotChips[i].alpha = if (s.steps.isEmpty() && mode != Mode.PICK) 0.45f else 1f
         }
+        btnAuto.text = "Auto: " + (if (autoSlot < 0) "Mati" else slots[autoSlot].name)
         btnSpeed.text = "Kecepatan: ${speeds[speedIdx]}x"
-        btnLoop.text = "Ulangi: ${loopLabel()}x"
+        status.text = note ?: when (mode) {
+            Mode.IDLE -> if (paused) "Macro (Beta) · dijeda" else "Macro (Beta) · siap"
+            Mode.PICK -> "Pilih slot untuk direkam"
+            Mode.RECORDING -> "● ${slots[recSlot].name} · ${slots[recSlot].steps.size} langkah"
+            Mode.PLAYING ->
+                "▶ ${slots[runSlot].name} · ${(stepIdx + 1).coerceAtMost(runSteps.size)}/${runSteps.size}"
+        }
+    }
+
+    private fun say(s: String) {
+        note = s
+        refreshUi()
+    }
+
+    // ---------- Tombol ----------
+
+    private fun onRecButton() {
+        note = null
+        when (mode) {
+            Mode.IDLE -> mode = Mode.PICK
+            Mode.PICK -> mode = Mode.IDLE
+            else -> return
+        }
+        refreshUi()
+    }
+
+    private fun onChip(i: Int) {
+        note = null
+        when (mode) {
+            Mode.PICK -> startRecording(i)
+            Mode.IDLE -> enqueue(i)
+            else -> {}
+        }
+    }
+
+    private fun cycleLevel(i: Int) {
+        if (mode != Mode.IDLE) return
+        val s = slots[i]
+        s.level = if (s.level >= 6) 1 else s.level + 1
+        saveAll()
+        refreshUi()
+    }
+
+    private fun cycleAuto() {
+        autoSlot = if (autoSlot >= slots.size - 1) -1 else autoSlot + 1
+        prefs.edit().putInt("auto", autoSlot).apply()
+        paused = false
+        autoRuns = 0
+        note = if (autoSlot >= 0 && !ocrSupported) "Auto butuh Android 11 ke atas" else null
+        refreshUi()
+        scheduleScan()
+    }
+
+    private fun togglePause() {
+        paused = !paused
+        if (!paused) autoRuns = 0
+        note = null
+        refreshUi()
+        scheduleScan()
     }
 
     // ---------- Rekam ----------
 
-    private fun startRecording() {
-        if (mode != Mode.IDLE) return
-        steps.clear()
+    private fun startRecording(i: Int) {
+        if (mode != Mode.PICK && mode != Mode.IDLE) return
+        recSlot = i
+        slots[i].steps.clear()
         lastUp = 0L
         curPoints = null
+        levelPending = 0
+        levelPts.clear()
+        note = null
         mode = Mode.RECORDING
 
         val v = View(this)
-        v.setBackgroundColor(0x14FF0000) // tint merah tipis = sedang merekam
+        v.setBackgroundColor(0x14FF0000)
         v.setOnTouchListener { _, e ->
             onCaptureTouch(e)
             true
@@ -255,17 +380,17 @@ class MacroService : AccessibilityService() {
         captureView = v
         captureParams = lp
 
-        // taruh panel di atas layer rekam supaya tombol Stop tetap bisa ditekan
         try { wm.removeView(panelRoot) } catch (e: Exception) {}
         wm.addView(panelRoot, panelParams)
         refreshUi()
     }
 
     private fun onCaptureTouch(e: MotionEvent) {
+        val st = slots[recSlot].steps
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downTime = e.eventTime
-                curDelay = if (steps.isEmpty()) 0L else (e.eventTime - lastUp).coerceAtLeast(0L)
+                curDelay = if (st.isEmpty()) 0L else (e.eventTime - lastUp).coerceAtLeast(0L)
                 curPoints = mutableListOf(floatArrayOf(e.rawX, e.rawY))
             }
             MotionEvent.ACTION_MOVE -> {
@@ -278,17 +403,32 @@ class MacroService : AccessibilityService() {
                 curPoints = null
                 lastUp = e.eventTime
                 val dur = (e.eventTime - downTime).coerceIn(1L, 59000L)
-                val step = Step(curDelay, dur, simplify(pts))
-                steps.add(step)
-                refreshUi()
-                passThrough(step)
+                val simple = simplify(pts)
+                if (levelPending > 0) {
+                    if (levelPending == 2) levelDelay = curDelay
+                    levelPts.add(floatArrayOf(simple[0][0], simple[0][1]))
+                    levelPending--
+                    if (levelPending == 0) {
+                        st.add(Step(1, levelDelay, 1L, ArrayList(levelPts)))
+                        levelPts.clear()
+                        note = null
+                    } else {
+                        note = "Sekarang tap tombol +"
+                    }
+                    refreshUi()
+                    passThrough(Step(0, 0L, dur, simple))
+                } else {
+                    val step = Step(0, curDelay, dur, simple)
+                    st.add(step)
+                    refreshUi()
+                    passThrough(step)
+                }
             }
             MotionEvent.ACTION_CANCEL -> curPoints = null
         }
     }
 
     private fun simplify(p: List<FloatArray>): List<FloatArray> {
-        // gerakan kecil = tap
         val slop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
         var maxD = 0f
         for (q in p) {
@@ -310,7 +450,6 @@ class MacroService : AccessibilityService() {
         return out
     }
 
-    // Teruskan gerakan yang baru direkam ke aplikasi di bawah layer rekam.
     private fun passThrough(step: Step) {
         val v = captureView ?: return
         val lp = captureParams ?: return
@@ -336,7 +475,7 @@ class MacroService : AccessibilityService() {
         captureParams = null
     }
 
-    // ---------- Putar ----------
+    // ---------- Putar + antrean ----------
 
     private fun buildGesture(s: Step, speed: Float): GestureDescription {
         val path = Path()
@@ -351,15 +490,47 @@ class MacroService : AccessibilityService() {
             .build()
     }
 
-    private fun startPlayback() {
-        if (mode != Mode.IDLE) return
-        if (steps.isEmpty()) {
-            status.text = "Belum ada rekaman"
+    // ubah penanda level jadi tap: turun ke level 1 dulu, lalu naik sesuai level slot
+    private fun expand(s: Slot): List<Step> {
+        val out = ArrayList<Step>()
+        for (st in s.steps) {
+            if (st.kind == 0) {
+                out.add(st)
+            } else {
+                val minus = st.points[0]
+                val plus = st.points[1]
+                for (n in 0 until 6) {
+                    out.add(Step(0, if (n == 0) st.delay else 250L, 60L, listOf(minus)))
+                }
+                for (n in 0 until (s.level - 1)) {
+                    out.add(Step(0, 250L, 60L, listOf(plus)))
+                }
+            }
+        }
+        return out
+    }
+
+    private fun enqueue(i: Int) {
+        if (slots[i].steps.isEmpty()) {
+            say("${slots[i].name} masih kosong, rekam dulu")
             return
         }
-        mode = Mode.PLAYING
-        loopsDone = 0
+        if (queue.contains(i) || (mode == Mode.PLAYING && runSlot == i)) return
+        queue.add(i)
+        runNext()
+    }
+
+    private fun runNext() {
+        if (mode != Mode.IDLE || queue.isEmpty()) return
+        startSlot(queue.removeAt(0))
+    }
+
+    private fun startSlot(i: Int) {
+        runSlot = i
+        runSteps = expand(slots[i])
         stepIdx = 0
+        note = null
+        mode = Mode.PLAYING
         token++
         refreshUi()
         scheduleStep(token)
@@ -367,28 +538,18 @@ class MacroService : AccessibilityService() {
 
     private fun scheduleStep(t: Int) {
         if (mode != Mode.PLAYING || t != token) return
-        if (stepIdx >= steps.size) {
-            loopsDone++
-            val total = loops[loopIdx]
-            if (total != 0 && loopsDone >= total) {
-                stopAll()
-                return
-            }
-            stepIdx = 0
+        if (stepIdx >= runSteps.size) {
+            finishRun()
+            return
         }
-        if (stepIdx == 0) refreshUi()
-        val s = steps[stepIdx]
-        val speed = speeds[speedIdx]
-        val wait = if (stepIdx == 0) {
-            if (loopsDone == 0) 300L else 500L
-        } else {
-            (s.delay / speed).toLong()
-        }
+        val s = runSteps[stepIdx]
+        val wait = if (stepIdx == 0) 300L else (s.delay / speeds[speedIdx]).toLong()
         handler.postDelayed({ dispatchStep(s, t) }, wait)
     }
 
     private fun dispatchStep(s: Step, t: Int) {
         if (mode != Mode.PLAYING || t != token) return
+        refreshUi()
         val ok = dispatchGesture(buildGesture(s, speeds[speedIdx]), object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 stepIdx++
@@ -399,55 +560,187 @@ class MacroService : AccessibilityService() {
                 scheduleStep(t)
             }
         }, null)
-        if (!ok) stopAll()
+        if (!ok) {
+            stopAll(false)
+            say("Gesture gagal dijalankan")
+        }
     }
 
-    private fun stopAll() {
+    private fun finishRun() {
+        mode = Mode.IDLE
+        lastRunEnd = System.currentTimeMillis()
+        note = null
+        refreshUi()
+        runNext()
+        scheduleScan()
+    }
+
+    private fun stopAll(userStop: Boolean) {
         token++
         handler.removeCallbacksAndMessages(null)
+        val wasRunning = mode == Mode.PLAYING || queue.isNotEmpty()
         if (mode == Mode.RECORDING) {
             removeCapture()
-            saveSteps()
+            saveAll()
         }
+        queue.clear()
         mode = Mode.IDLE
-        if (::status.isInitialized) refreshUi()
+        note = null
+        if (userStop && wasRunning) paused = true
+        if (::status.isInitialized) {
+            refreshUi()
+            scheduleScan()
+        }
+    }
+
+    // ---------- OCR: pantau counter pasukan + teks "pasukan kembali" ----------
+
+    private fun scheduleScan() {
+        handler.removeCallbacks(scanTask)
+        if (!ocrSupported || autoSlot < 0) return
+        handler.postDelayed(scanTask, 3000L)
+    }
+
+    private fun grab(cb: (Bitmap?) -> Unit) {
+        if (Build.VERSION.SDK_INT < 30) {
+            cb(null)
+            return
+        }
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+            object : AccessibilityService.TakeScreenshotCallback {
+                override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                    val hb = result.hardwareBuffer
+                    val bmp = Bitmap.wrapHardwareBuffer(hb, result.colorSpace)
+                        ?.copy(Bitmap.Config.ARGB_8888, false)
+                    hb.close()
+                    cb(bmp)
+                }
+                override fun onFailure(errorCode: Int) {
+                    cb(null)
+                }
+            })
+    }
+
+    private fun doScan() {
+        if (autoSlot < 0 || mode != Mode.IDLE || paused || scanning || queue.isNotEmpty()) {
+            scheduleScan()
+            return
+        }
+        scanning = true
+        grab { bmp ->
+            if (bmp == null) {
+                scanning = false
+                scheduleScan()
+                return@grab
+            }
+            val w = bmp.width
+            val h = bmp.height
+            recognizer.process(InputImage.fromBitmap(bmp, 0))
+                .addOnSuccessListener { t ->
+                    bmp.recycle()
+                    scanning = false
+                    onScan(analyze(t, w, h))
+                }
+                .addOnFailureListener {
+                    bmp.recycle()
+                    scanning = false
+                    scheduleScan()
+                }
+        }
+    }
+
+    private fun analyze(t: Text, w: Int, h: Int): Scan {
+        var cur = -1
+        var max = -1
+        var toast = false
+        val re = Regex("^(\\d{1,2})\\s*/\\s*(\\d{1,2})$")
+        for (b in t.textBlocks) {
+            for (l in b.lines) {
+                val s = l.text.trim()
+                if (s.contains("kembali ke kota", true)) toast = true
+                val box = l.boundingBox
+                if (box != null && box.centerX() > w * 0.8 && box.centerY() < h * 0.4) {
+                    val m = re.find(s)
+                    if (m != null) {
+                        cur = m.groupValues[1].toInt()
+                        max = m.groupValues[2].toInt()
+                    }
+                }
+            }
+        }
+        return Scan(cur, max, toast)
+    }
+
+    private fun onScan(sc: Scan) {
+        if (mode == Mode.IDLE && !paused && autoSlot >= 0) {
+            if (sc.cur >= 0 && sc.max > 0 && sc.cur >= sc.max) autoRuns = 0
+            val freeSlot = sc.cur >= 0 && sc.max > 0 && sc.cur < sc.max
+            val cooled = System.currentTimeMillis() - lastRunEnd > 10000L
+            if ((freeSlot || sc.toast) && cooled) {
+                if (autoRuns >= 3) {
+                    paused = true
+                    say("Auto berhenti: counter tidak naik 3x")
+                } else {
+                    autoRuns++
+                    enqueue(autoSlot)
+                }
+            }
+        }
+        scheduleScan()
     }
 
     // ---------- Simpan / muat ----------
 
-    private fun saveSteps() {
+    private fun saveAll() {
         val arr = JSONArray()
-        for (s in steps) {
+        for (s in slots) {
             val o = JSONObject()
-            o.put("d", s.delay)
-            o.put("t", s.duration)
-            val pa = JSONArray()
-            for (p in s.points) {
-                pa.put(JSONArray().put(p[0].toDouble()).put(p[1].toDouble()))
+            o.put("name", s.name)
+            o.put("level", s.level)
+            val sa = JSONArray()
+            for (st in s.steps) {
+                val so = JSONObject()
+                so.put("k", st.kind)
+                so.put("d", st.delay)
+                so.put("t", st.duration)
+                val pa = JSONArray()
+                for (p in st.points) {
+                    pa.put(JSONArray().put(p[0].toDouble()).put(p[1].toDouble()))
+                }
+                so.put("p", pa)
+                sa.put(so)
             }
-            o.put("p", pa)
+            o.put("steps", sa)
             arr.put(o)
         }
-        prefs.edit().putString("steps", arr.toString()).apply()
+        prefs.edit().putString("slots", arr.toString()).apply()
     }
 
-    private fun loadSteps() {
-        steps.clear()
-        val raw = prefs.getString("steps", null) ?: return
+    private fun loadAll() {
+        val raw = prefs.getString("slots", null) ?: return
         try {
             val arr = JSONArray(raw)
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                val pa = o.getJSONArray("p")
-                val pts = ArrayList<FloatArray>()
-                for (j in 0 until pa.length()) {
-                    val q = pa.getJSONArray(j)
-                    pts.add(floatArrayOf(q.getDouble(0).toFloat(), q.getDouble(1).toFloat()))
+                val slot = slots.firstOrNull { it.name == o.getString("name") } ?: continue
+                slot.level = o.optInt("level", 4).coerceIn(1, 6)
+                slot.steps.clear()
+                val sa = o.getJSONArray("steps")
+                for (j in 0 until sa.length()) {
+                    val so = sa.getJSONObject(j)
+                    val pa = so.getJSONArray("p")
+                    val pts = ArrayList<FloatArray>()
+                    for (k in 0 until pa.length()) {
+                        val q = pa.getJSONArray(k)
+                        pts.add(floatArrayOf(q.getDouble(0).toFloat(), q.getDouble(1).toFloat()))
+                    }
+                    if (pts.isNotEmpty()) {
+                        slot.steps.add(Step(so.getInt("k"), so.getLong("d"), so.getLong("t"), pts))
+                    }
                 }
-                if (pts.isNotEmpty()) steps.add(Step(o.getLong("d"), o.getLong("t"), pts))
             }
         } catch (e: Exception) {
-            steps.clear()
+            for (s in slots) s.steps.clear()
         }
     }
 }

@@ -33,12 +33,12 @@ class MainActivity : Activity() {
         info.setPadding(0, pad / 2, 0, pad / 2)
         info.text = "Cara pakai:\n" +
             "1. Aktifkan layanan Macro Recorder di Pengaturan Aksesibilitas.\n" +
-            "2. Panel melayang akan muncul di layar.\n" +
-            "3. Tekan Rec, lalu lakukan tap atau geser seperti biasa.\n" +
-            "4. Tekan Stop. Tekan Play untuk memutar ulang.\n" +
-            "5. Tombol roda gigi untuk Settings (kecepatan, jumlah ulang, hapus rekaman).\n\n" +
-            "Kalau tombol aksesibilitas abu-abu (Android 13+): buka Info aplikasi, " +
-            "menu titik tiga, pilih Izinkan setelan terbatas."
+            "2. Tap Rec, pilih slot (Barbar Fort, Food, Wood, Stone, Gold, Gems), lalu rekam.\n" +
+            "3. Saat merekam menu pencarian, tap +Level lalu tap tombol - dan +.\n" +
+            "4. Tap Stop. Tap nama slot untuk menjalankan. Tahan nama slot untuk ganti level.\n" +
+            "5. Roda gigi: Auto (slot yang jalan otomatis saat pasukan pulang), kecepatan, hapus rekaman.\n\n" +
+            "Auto butuh Android 11 ke atas. Kalau tombol aksesibilitas abu-abu (Android 13+): " +
+            "buka Info aplikasi, menu titik tiga, pilih Izinkan setelan terbatas."
         root.addView(info)
 
         status = TextView(this)
