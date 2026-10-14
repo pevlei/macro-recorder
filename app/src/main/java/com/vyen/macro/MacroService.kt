@@ -1128,13 +1128,24 @@ class MacroService : AccessibilityService() {
                     tapPx(nb.cx, nb.cy) { bfSchedule(1500) }
                     return
                 }
-                if (sc.has("dari kotamu")) {
-                    tapFrac(sc, 0.8024f, 0.2f) { bfSchedule(1500) }
-                    return
-                }
-                if (sc.has("Antrean") && bfTries in 2..5) {
+                if (sc.has("dari kotamu") || sc.has("Antrean")) {
+                    if (bfTries >= 8) {
+                        bfFail("Layar pasukan tidak muncul", sc)
+                        return
+                    }
+                    val direct = bfTries % 2 == 0
                     bfTries++
-                    tapFrac(sc, 0.9306f, 0.1475f) { bfSchedule(1500) }
+                    if (direct) {
+                        // popup biasanya sudah muncul: tap langsung tombol Pasukan Baru
+                        tapFrac(sc, 0.8024f, 0.2f) { bfSchedule(1500) }
+                    } else {
+                        // popup mungkin sudah hilang: tap + dulu, lalu tombol Pasukan Baru
+                        tapFrac(sc, 0.9306f, 0.1475f) {
+                            handler.postDelayed({
+                                if (bfOn) tapFrac(sc, 0.8024f, 0.2f) { bfSchedule(1500) }
+                            }, 800L)
+                        }
+                    }
                     return
                 }
                 if (bfTries++ >= 8) {
