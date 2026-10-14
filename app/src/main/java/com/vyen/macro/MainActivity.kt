@@ -36,6 +36,7 @@ class MainActivity : Activity() {
             "2. Buka game dan masuk ke peta.\n" +
             "3. Di panel Rally Bot, atur Level fort dan Slot pasukan (isi dulu slot itu di game).\n" +
             "4. Nyalakan saklar Rally Barbarian Fort. Bot jalan sendiri, matikan saklar untuk berhenti.\n" +
+            "   Atau nyalakan Farm Gems: peta digeser otomatis sampai gem deposit ketemu.\n" +
             "5. Ikon roda gigi di panel: pengaturan kecepatan.\n\n" +
             "Butuh Android 11 ke atas dan game berbahasa Indonesia. " +
             "Kalau tombol aksesibilitas abu-abu (Android 13+): buka Info aplikasi, " +

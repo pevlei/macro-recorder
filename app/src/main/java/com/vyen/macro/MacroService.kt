@@ -19,6 +19,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import java.util.concurrent.Executors
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.google.mlkit.vision.common.InputImage
@@ -70,12 +71,36 @@ class MacroService : AccessibilityService() {
     )
     private val bfTask = Runnable { bfTick() }
 
+    // bot Farm Gems: geser peta (spiral) sambil cari gambar gem deposit
+    private class GemHit(val cx: Float, val cy: Float, val count: Int, val bw: Float, val bh: Float)
+
+    private enum class Gm { CHECK, SCAN }
+
+    private var gemOn = false
+    private var gm = Gm.CHECK
+    private var gemBusy = false
+    private var gemSteps = 0
+    private var gemNull = 0
+    private var gemWait = 0
+    private var gemDir = 0
+    private var gemLegLen = 1
+    private var gemLegDone = 0
+    private var gemLegsAtLen = 0
+    private var gemStatus = ""
+    private val gemMaxSteps = 60
+    private val gemTask = Runnable { gemTick() }
+    private val gemExec = Executors.newSingleThreadExecutor()
+    private var gemMarker: View? = null
+    private var gemW = 0
+    private var gemH = 0
+
     // panel
     private lateinit var panelRoot: LinearLayout
     private lateinit var panelParams: WindowManager.LayoutParams
     private lateinit var status: TextView
     private lateinit var dbgView: TextView
     private lateinit var toggle: TextView
+    private lateinit var gemToggle: TextView
     private lateinit var configBox: LinearLayout
     private lateinit var settingsBox: LinearLayout
     private lateinit var levelText: TextView
@@ -106,6 +131,7 @@ class MacroService : AccessibilityService() {
 
     override fun onInterrupt() {
         if (bfOn) bfSetOn(false)
+        if (gemOn) gemSetOn(false)
     }
 
     override fun onDestroy() {
@@ -113,6 +139,9 @@ class MacroService : AccessibilityService() {
         if (::wm.isInitialized) {
             handler.removeCallbacksAndMessages(null)
             bfOn = false
+            gemOn = false
+            gemExec.shutdown()
+            gemHideMarker()
             try { wm.removeView(panelRoot) } catch (e: Exception) {}
         }
     }
@@ -221,6 +250,17 @@ class MacroService : AccessibilityService() {
         swRow.addView(toggle)
         panelRoot.addView(swRow)
 
+        val gemRow = row(8)
+        val gemLabel = TextView(this)
+        gemLabel.text = "Farm Gems"
+        gemLabel.setTextColor(Color.WHITE)
+        gemLabel.textSize = 15f
+        gemRow.addView(gemLabel, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        gemToggle = pill("OFF", 14f) { gemSetOn(!gemOn) }
+        gemToggle.minWidth = dp(64)
+        gemRow.addView(gemToggle)
+        panelRoot.addView(gemRow)
+
         // pengaturan bot (disembunyikan saat bot jalan)
         configBox = LinearLayout(this)
         configBox.orientation = LinearLayout.VERTICAL
@@ -328,11 +368,15 @@ class MacroService : AccessibilityService() {
 
     private fun refreshUi() {
         val bot = bfOn
-        configBox.visibility = if (bot) View.GONE else View.VISIBLE
-        if (bot) settingsBox.visibility = View.GONE
-        dbgView.visibility = if (bot) View.VISIBLE else View.GONE
+        val gem = gemOn
+        val running = bot || gem
+        configBox.visibility = if (running) View.GONE else View.VISIBLE
+        if (running) settingsBox.visibility = View.GONE
+        dbgView.visibility = if (running) View.VISIBLE else View.GONE
         toggle.text = if (bot) "ON" else "OFF"
         toggle.background = roundBg(if (bot) 0xFF1E9E63.toInt() else 0xFF3A3F47.toInt(), 14)
+        gemToggle.text = if (gem) "ON" else "OFF"
+        gemToggle.background = roundBg(if (gem) 0xFF1E9E63.toInt() else 0xFF3A3F47.toInt(), 14)
         levelText.text = "$bfLevel"
         for (i in slotBtns.indices) {
             slotBtns[i].background =
@@ -342,7 +386,323 @@ class MacroService : AccessibilityService() {
             speedBtns[i].background =
                 roundBg(if (speedIdx == i) 0xFF2F6BFF.toInt() else 0xFF2B2F36.toInt(), 12)
         }
-        status.text = note ?: if (bot) "$bfCount rally · $bfStatus" else "Siap. Atur level lalu nyalakan."
+        status.text = note ?: if (bot) "$bfCount rally · $bfStatus"
+            else if (gem) "$gemSteps geseran · $gemStatus"
+            else "Siap. Atur level lalu nyalakan."
+    }
+
+    // ---------- Bot Farm Gems (cari gem deposit dengan menggeser peta) ----------
+
+    private fun gemSetOn(on: Boolean) {
+        if (on == gemOn) return
+        if (on && !ocrSupported) {
+            note = "Bot butuh Android 11 ke atas"
+            refreshUi()
+            return
+        }
+        if (on && bfOn) bfSetOn(false)
+        gemOn = on
+        if (on) {
+            gm = Gm.CHECK
+            gemBusy = false
+            gemSteps = 0
+            gemNull = 0
+            gemWait = 0
+            gemDir = 0
+            gemLegLen = 1
+            gemLegDone = 0
+            gemLegsAtLen = 0
+            gemStatus = "mulai"
+            note = null
+            gemHideMarker()
+            refreshUi()
+            panelAside()
+            gemSchedule(500)
+        } else {
+            handler.removeCallbacks(gemTask)
+            panelRoot.alpha = 1f
+            gemStatus = ""
+            panelBack()
+            refreshUi()
+        }
+    }
+
+    private fun gemSchedule(ms: Long) {
+        handler.removeCallbacks(gemTask)
+        val d = (ms / speeds[speedIdx]).toLong().coerceAtLeast(400L)
+        if (gemOn) handler.postDelayed(gemTask, d)
+    }
+
+    private fun gemStop(msg: String) {
+        gemSetOn(false)
+        note = msg
+        refreshUi()
+    }
+
+    private fun gemTick() {
+        if (!gemOn) return
+        if (gemBusy) {
+            gemSchedule(1000)
+            return
+        }
+        gemBusy = true
+        when (gm) {
+            Gm.CHECK -> readScreen { sc ->
+                gemBusy = false
+                if (!gemOn) return@readScreen
+                if (sc == null) {
+                    if (++gemNull >= 5) gemStop("Screenshot gagal, game mungkin memblokir")
+                    else gemSchedule(1000)
+                    return@readScreen
+                }
+                gemNull = 0
+                gemW = sc.w
+                gemH = sc.h
+                if (mapVisible(sc)) {
+                    gm = Gm.SCAN
+                    gemWait = 0
+                    gemStatus = "mencari gem"
+                    refreshUi()
+                    gemSchedule(300)
+                } else if (++gemWait >= 8) {
+                    gemStop("Buka peta dulu (bukan di dalam kota)")
+                } else {
+                    gemStatus = "menunggu peta"
+                    refreshUi()
+                    gemSchedule(2500)
+                }
+            }
+            Gm.SCAN -> gemShot { hit, ok ->
+                gemBusy = false
+                if (!gemOn) return@gemShot
+                if (!ok) {
+                    if (++gemNull >= 5) gemStop("Screenshot gagal, game mungkin memblokir")
+                    else gemSchedule(1000)
+                    return@gemShot
+                }
+                gemNull = 0
+                if (hit != null) {
+                    gemHideMarker()
+                    gemShowMarker(hit)
+                    val n = gemSteps
+                    gemStop("Gem deposit KETEMU (geseran ke-$n). Cek lingkaran merah di layar.")
+                    return@gemShot
+                }
+                if (gemSteps >= gemMaxSteps) {
+                    gemStop("Gem tidak ketemu setelah $gemMaxSteps geseran")
+                    return@gemShot
+                }
+                gemMove()
+            }
+        }
+    }
+
+    // ambil screenshot (panel disembunyikan), analisis warna di thread terpisah
+    private fun gemShot(cb: (GemHit?, Boolean) -> Unit) {
+        panelRoot.alpha = 0f
+        handler.postDelayed({
+            grab { bmp ->
+                panelRoot.alpha = 1f
+                if (bmp == null) {
+                    cb(null, false)
+                    return@grab
+                }
+                gemExec.execute {
+                    val hit = try { gemFind(bmp) } catch (e: Exception) { null }
+                    bmp.recycle()
+                    handler.post { cb(hit, true) }
+                }
+            }
+        }, 150L)
+    }
+
+    private fun isGemRed(c: Int): Boolean {
+        val r = Color.red(c)
+        val g = Color.green(c)
+        val b = Color.blue(c)
+        val mx = maxOf(r, maxOf(g, b))
+        val mn = minOf(r, minOf(g, b))
+        if (mx == 0 || r != mx) return false
+        val d = mx - mn
+        if (d == 0) return false
+        val s = d.toFloat() / mx
+        val v = mx / 255f
+        var hue = ((g - b).toFloat() / d) * 60f
+        if (hue < 0f) hue += 360f
+        return (hue >= 340f || hue <= 12f) && s >= 0.45f && v >= 0.22f && v <= 0.95f
+    }
+
+    // cari gumpalan merah kristal (ciri gem deposit) di area peta; UI game (atas, bawah, kiri, kanan) diabaikan
+    private fun gemFind(bmp: Bitmap): GemHit? {
+        val w = bmp.width
+        val h = bmp.height
+        val stride = maxOf(2, w / 640)
+        val gw = w / stride
+        val gh = h / stride
+        val red = BooleanArray(gw * gh)
+        var total = 0
+        for (y in 0 until gh) {
+            val fy = y * stride / h.toFloat()
+            if (fy < 0.17f || fy > 0.84f) continue
+            for (x in 0 until gw) {
+                val fx = x * stride / w.toFloat()
+                if (fx < 0.17f || fx > 0.90f) continue
+                if (isGemRed(bmp.getPixel(x * stride, y * stride))) {
+                    red[y * gw + x] = true
+                    total++
+                }
+            }
+        }
+        if (total == 0) return null
+
+        // dilasi 2 kali (3x3) supaya sisi kristal yang terang tetap tersambung
+        var cur = red
+        for (n in 0 until 2) {
+            val nx = BooleanArray(gw * gh)
+            for (y in 0 until gh) for (x in 0 until gw) {
+                if (!cur[y * gw + x]) continue
+                for (dy in -1..1) for (dx in -1..1) {
+                    val yy = y + dy
+                    val xx = x + dx
+                    if (yy in 0 until gh && xx in 0 until gw) nx[yy * gw + xx] = true
+                }
+            }
+            cur = nx
+        }
+
+        val seen = BooleanArray(gw * gh)
+        val stack = IntArray(gw * gh)
+        val minCount = (gw * gh * 0.0008f).toInt().coerceAtLeast(40)
+        var best: GemHit? = null
+        for (start in 0 until gw * gh) {
+            if (!cur[start] || seen[start]) continue
+            var sp = 0
+            stack[sp++] = start
+            seen[start] = true
+            var cnt = 0
+            var sx = 0L
+            var sy = 0L
+            var x0 = gw
+            var x1 = 0
+            var y0 = gh
+            var y1 = 0
+            while (sp > 0) {
+                val i = stack[--sp]
+                val x = i % gw
+                val y = i / gw
+                if (red[i]) {
+                    cnt++
+                    sx += x
+                    sy += y
+                    if (x < x0) x0 = x
+                    if (x > x1) x1 = x
+                    if (y < y0) y0 = y
+                    if (y > y1) y1 = y
+                }
+                for (dy in -1..1) for (dx in -1..1) {
+                    val yy = y + dy
+                    val xx = x + dx
+                    if (yy < 0 || yy >= gh || xx < 0 || xx >= gw) continue
+                    val j = yy * gw + xx
+                    if (cur[j] && !seen[j]) {
+                        seen[j] = true
+                        stack[sp++] = j
+                    }
+                }
+            }
+            if (cnt < minCount) continue
+            val bw = (x1 - x0 + 1).toFloat() / gw
+            val bh = (y1 - y0 + 1).toFloat() / gh
+            val fill = cnt.toFloat() / ((x1 - x0 + 1) * (y1 - y0 + 1))
+            val ratio = (bw * w) / (bh * h)
+            if (bw < 0.03f || bw > 0.25f) continue
+            if (fill < 0.10f) continue
+            if (ratio < 0.3f || ratio > 3f) continue
+            if (best == null || cnt > best.count) {
+                best = GemHit((sx.toFloat() / cnt) * stride, (sy.toFloat() / cnt) * stride, cnt, bw, bh)
+            }
+        }
+        return best
+    }
+
+    // geser peta satu langkah mengikuti pola spiral (1,1,2,2,3,3,... langkah per arah)
+    private fun gemMove() {
+        val dm = resources.displayMetrics
+        val w = (if (gemW > 0) gemW else dm.widthPixels).toFloat()
+        val h = (if (gemH > 0) gemH else dm.heightPixels).toFloat()
+        val x1: Float
+        val y1: Float
+        val x2: Float
+        val y2: Float
+        when (gemDir) {
+            0 -> { x1 = w * 0.8f; y1 = h * 0.5f; x2 = w * 0.2f; y2 = h * 0.5f }   // lihat ke kanan
+            1 -> { x1 = w * 0.5f; y1 = h * 0.78f; x2 = w * 0.5f; y2 = h * 0.2f }  // lihat ke bawah
+            2 -> { x1 = w * 0.2f; y1 = h * 0.5f; x2 = w * 0.8f; y2 = h * 0.5f }   // lihat ke kiri
+            else -> { x1 = w * 0.5f; y1 = h * 0.2f; x2 = w * 0.5f; y2 = h * 0.78f } // lihat ke atas
+        }
+        gemSteps++
+        gemStatus = "geser peta"
+        refreshUi()
+
+        gemLegDone++
+        if (gemLegDone >= gemLegLen) {
+            gemLegDone = 0
+            gemDir = (gemDir + 1) % 4
+            gemLegsAtLen++
+            if (gemLegsAtLen >= 2) {
+                gemLegsAtLen = 0
+                gemLegLen++
+            }
+        }
+
+        val p = Path()
+        p.moveTo(x1, y1)
+        p.lineTo(x2, y2)
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0L, 450L))
+            .build()
+        val after = {
+            gemStatus = "mencari gem"
+            gemSchedule(1100)
+        }
+        val ok = dispatchGesture(g, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { after() }
+            override fun onCancelled(gestureDescription: GestureDescription?) { after() }
+        }, null)
+        if (!ok) after()
+    }
+
+    // lingkaran merah sementara di posisi gem yang ketemu
+    private fun gemShowMarker(hit: GemHit) {
+        val d = maxOf(dp(60), (hit.bw * resources.displayMetrics.widthPixels * 1.4f).toInt())
+        val v = View(this)
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.OVAL
+        g.setColor(0x00000000)
+        g.setStroke(dp(4), 0xFFFF2D2D.toInt())
+        v.background = g
+        val lp = WindowManager.LayoutParams(
+            d, d,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = (hit.cx - d / 2f).toInt()
+        lp.y = (hit.cy - d / 2f).toInt()
+        try {
+            wm.addView(v, lp)
+            gemMarker = v
+            handler.postDelayed({ gemHideMarker() }, 8000L)
+        } catch (e: Exception) {}
+    }
+
+    private fun gemHideMarker() {
+        val v = gemMarker ?: return
+        gemMarker = null
+        try { wm.removeView(v) } catch (e: Exception) {}
     }
 
     // ---------- Bot Rally Barbarian Fort ----------
@@ -354,6 +714,7 @@ class MacroService : AccessibilityService() {
             refreshUi()
             return
         }
+        if (on && gemOn) gemSetOn(false)
         bfOn = on
         if (on) {
             bf = Bf.WAIT
@@ -365,22 +726,30 @@ class MacroService : AccessibilityService() {
             bfStatus = "mulai"
             note = null
             refreshUi()
-            // geser panel ke tengah atas supaya tidak menutupi titik tap bot
-            savedX = panelParams.x
-            savedY = panelParams.y
-            panelParams.x = (resources.displayMetrics.widthPixels * 0.36f).toInt()
-            panelParams.y = dp(2)
-            try { wm.updateViewLayout(panelRoot, panelParams) } catch (e: Exception) {}
+            panelAside()
             bfSchedule(500)
         } else {
             handler.removeCallbacks(bfTask)
             panelRoot.alpha = 1f
             bfStatus = ""
-            panelParams.x = savedX
-            panelParams.y = savedY
-            try { wm.updateViewLayout(panelRoot, panelParams) } catch (e: Exception) {}
+            panelBack()
             refreshUi()
         }
+    }
+
+    // geser panel ke tengah atas supaya tidak menutupi titik tap bot
+    private fun panelAside() {
+        savedX = panelParams.x
+        savedY = panelParams.y
+        panelParams.x = (resources.displayMetrics.widthPixels * 0.36f).toInt()
+        panelParams.y = dp(2)
+        try { wm.updateViewLayout(panelRoot, panelParams) } catch (e: Exception) {}
+    }
+
+    private fun panelBack() {
+        panelParams.x = savedX
+        panelParams.y = savedY
+        try { wm.updateViewLayout(panelRoot, panelParams) } catch (e: Exception) {}
     }
 
     // jeda antar langkah diskalakan dengan pengaturan kecepatan
