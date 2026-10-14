@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -90,7 +91,12 @@ class MacroService : AccessibilityService() {
     private val gemMaxSteps = 60
     private val gemTask = Runnable { gemTick() }
     private val gemExec = Executors.newSingleThreadExecutor()
+    private val gemThreshold = 0.65f
+    private val gemTemplate: Bitmap? by lazy {
+        try { assets.open("gem_template.png").use { BitmapFactory.decodeStream(it) } } catch (e: Exception) { null }
+    }
     private var gemMarker: View? = null
+    private var gemRejected = -1f
     private var gemW = 0
     private var gemH = 0
 
@@ -492,6 +498,9 @@ class MacroService : AccessibilityService() {
                     gemStop("Gem tidak ketemu setelah $gemMaxSteps geseran")
                     return@gemShot
                 }
+                if (gemRejected >= 0f) {
+                    dbgView.text = "Ada merah tapi bukan gem (skor " + String.format("%.2f", gemRejected) + ")"
+                }
                 gemMove()
             }
         }
@@ -574,6 +583,8 @@ class MacroService : AccessibilityService() {
         val stack = IntArray(gw * gh)
         val minCount = (gw * gh * 0.0008f).toInt().coerceAtLeast(40)
         var best: GemHit? = null
+        var gray: IntArray? = null
+        gemRejected = -1f
         for (start in 0 until gw * gh) {
             if (!cur[start] || seen[start]) continue
             var sp = 0
@@ -618,8 +629,88 @@ class MacroService : AccessibilityService() {
             if (bw < 0.03f || bw > 0.25f) continue
             if (fill < 0.10f) continue
             if (ratio < 0.3f || ratio > 3f) continue
+            val ccx = (sx.toFloat() / cnt) * stride
+            val ccy = (sy.toFloat() / cnt) * stride
+            // cocokkan dengan gambar gem asli (bukan cuma warna)
+            if (gray == null) {
+                val sm = Bitmap.createScaledBitmap(bmp, gw, gh, true)
+                val px = IntArray(gw * gh)
+                sm.getPixels(px, 0, gw, 0, 0, gw, gh)
+                if (sm !== bmp) sm.recycle()
+                gray = IntArray(gw * gh) { k ->
+                    val c = px[k]
+                    (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+                }
+            }
+            val gr = gray ?: continue
+            val score = gemMatch(gr, gw, gh, ccx / stride, ccy / stride, w, stride)
+            if (score < gemThreshold) {
+                if (score > gemRejected) gemRejected = score
+                continue
+            }
             if (best == null || cnt > best.count) {
-                best = GemHit((sx.toFloat() / cnt) * stride, (sy.toFloat() / cnt) * stride, cnt, bw, bh)
+                best = GemHit(ccx, ccy, cnt, bw, bh)
+            }
+        }
+        return best
+    }
+
+    // template matching (NCC, grayscale) di sekitar kandidat merah, beberapa skala; skor 1.0 = persis sama
+    private fun gemMatch(g: IntArray, gw: Int, gh: Int, cx: Float, cy: Float, fullW: Int, stride: Int): Float {
+        val tpl = gemTemplate ?: return 0f
+        var best = -1f
+        val mults = floatArrayOf(0.8f, 0.9f, 1.0f, 1.1f, 1.2f)
+        for (m in mults) {
+            val sz = Math.round(tpl.width * m * (fullW / 2576f) / stride).coerceAtLeast(12)
+            if (sz >= gw || sz >= gh) continue
+            val sb = Bitmap.createScaledBitmap(tpl, sz, sz, true)
+            val tp = IntArray(sz * sz)
+            sb.getPixels(tp, 0, sz, 0, 0, sz, sz)
+            if (sb !== tpl) sb.recycle()
+            val t = FloatArray(sz * sz) { k ->
+                val c = tp[k]
+                ((Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000).toFloat()
+            }
+            var tm = 0f
+            for (v in t) tm += v
+            tm /= t.size
+            var tn = 0f
+            for (k in t.indices) {
+                t[k] -= tm
+                tn += t[k] * t[k]
+            }
+            if (tn < 1f) continue
+            var dy = -16
+            while (dy <= 16) {
+                var dx = -16
+                while (dx <= 16) {
+                    val x0 = (cx - sz / 2f + dx).toInt()
+                    val y0 = (cy - sz / 2f + dy).toInt()
+                    if (x0 >= 0 && y0 >= 0 && x0 + sz <= gw && y0 + sz <= gh) {
+                        var sm = 0f
+                        for (yy in 0 until sz) {
+                            val row = (y0 + yy) * gw + x0
+                            for (xx in 0 until sz) sm += g[row + xx]
+                        }
+                        val mean = sm / (sz * sz)
+                        var num = 0f
+                        var den = 0f
+                        for (yy in 0 until sz) {
+                            val row = (y0 + yy) * gw + x0
+                            for (xx in 0 until sz) {
+                                val d = g[row + xx] - mean
+                                num += d * t[yy * sz + xx]
+                                den += d * d
+                            }
+                        }
+                        if (den > 1f) {
+                            val sc = num / Math.sqrt((den * tn).toDouble()).toFloat()
+                            if (sc > best) best = sc
+                        }
+                    }
+                    dx += 2
+                }
+                dy += 2
             }
         }
         return best
