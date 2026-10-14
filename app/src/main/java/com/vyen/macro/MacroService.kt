@@ -96,7 +96,8 @@ class MacroService : AccessibilityService() {
         try { assets.open("gem_template.png").use { BitmapFactory.decodeStream(it) } } catch (e: Exception) { null }
     }
     private var gemMarker: View? = null
-    private var gemRejected = -1f
+    private var gemBest = -1f
+    private var gemErr = ""
     private var gemW = 0
     private var gemH = 0
 
@@ -487,6 +488,9 @@ class MacroService : AccessibilityService() {
                     return@gemShot
                 }
                 gemNull = 0
+                dbgView.text = if (gemErr.isNotEmpty()) "ERROR: $gemErr"
+                    else "skor gem terbaik " + String.format("%.2f", gemBest) +
+                        " (butuh " + String.format("%.2f", gemThreshold) + ")"
                 if (hit != null) {
                     gemHideMarker()
                     gemShowMarker(hit)
@@ -497,9 +501,6 @@ class MacroService : AccessibilityService() {
                 if (gemSteps >= gemMaxSteps) {
                     gemStop("Gem tidak ketemu setelah $gemMaxSteps geseran")
                     return@gemShot
-                }
-                if (gemRejected >= 0f) {
-                    dbgView.text = "Ada merah tapi bukan gem (skor " + String.format("%.2f", gemRejected) + ")"
                 }
                 gemMove()
             }
@@ -517,7 +518,7 @@ class MacroService : AccessibilityService() {
                     return@grab
                 }
                 gemExec.execute {
-                    val hit = try { gemFind(bmp) } catch (e: Exception) { null }
+                    val hit = try { gemFind(bmp) } catch (e: Throwable) { gemErr = e.toString().take(80); null }
                     bmp.recycle()
                     handler.post { cb(hit, true) }
                 }
@@ -525,144 +526,53 @@ class MacroService : AccessibilityService() {
         }, 150L)
     }
 
-    private fun isGemRed(c: Int): Boolean {
-        val r = Color.red(c)
-        val g = Color.green(c)
-        val b = Color.blue(c)
-        val mx = maxOf(r, maxOf(g, b))
-        val mn = minOf(r, minOf(g, b))
-        if (mx == 0 || r != mx) return false
-        val d = mx - mn
-        if (d == 0) return false
-        val s = d.toFloat() / mx
-        val v = mx / 255f
-        var hue = ((g - b).toFloat() / d) * 60f
-        if (hue < 0f) hue += 360f
-        return (hue >= 340f || hue <= 12f) && s >= 0.45f && v >= 0.22f && v <= 0.95f
-    }
-
-    // cari gumpalan merah kristal (ciri gem deposit) di area peta; UI game (atas, bawah, kiri, kanan) diabaikan
+    // cari gambar gem deposit di seluruh layar dengan template matching (NCC, abu-abu, banyak skala).
+    // tidak bergantung warna, jadi tahan siang/malam; dikerjakan di resolusi kecil supaya cepat
     private fun gemFind(bmp: Bitmap): GemHit? {
+        gemErr = ""
+        gemBest = -1f
+        val tpl = gemTemplate
+        if (tpl == null) {
+            gemErr = "template gem gagal dimuat (folder assets hilang?)"
+            return null
+        }
         val w = bmp.width
         val h = bmp.height
-        val stride = maxOf(2, w / 640)
+        val stride = maxOf(4, w / 320)
         val gw = w / stride
         val gh = h / stride
-        val red = BooleanArray(gw * gh)
-        var total = 0
+        val sm = Bitmap.createScaledBitmap(bmp, gw, gh, true)
+        val px = IntArray(gw * gh)
+        sm.getPixels(px, 0, gw, 0, 0, gw, gh)
+        if (sm !== bmp) sm.recycle()
+        val g = IntArray(gw * gh) { k ->
+            val c = px[k]
+            (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+        }
+        // integral image: jumlah dan jumlah kuadrat
+        val iw = gw + 1
+        val sum = LongArray(iw * (gh + 1))
+        val sq = LongArray(iw * (gh + 1))
         for (y in 0 until gh) {
-            val fy = y * stride / h.toFloat()
-            if (fy < 0.17f || fy > 0.84f) continue
+            var rs = 0L
+            var rq = 0L
             for (x in 0 until gw) {
-                val fx = x * stride / w.toFloat()
-                if (fx < 0.17f || fx > 0.90f) continue
-                if (isGemRed(bmp.getPixel(x * stride, y * stride))) {
-                    red[y * gw + x] = true
-                    total++
-                }
+                val v = g[y * gw + x].toLong()
+                rs += v
+                rq += v * v
+                sum[(y + 1) * iw + x + 1] = sum[y * iw + x + 1] + rs
+                sq[(y + 1) * iw + x + 1] = sq[y * iw + x + 1] + rq
             }
         }
-        if (total == 0) return null
 
-        // dilasi 2 kali (3x3) supaya sisi kristal yang terang tetap tersambung
-        var cur = red
-        for (n in 0 until 2) {
-            val nx = BooleanArray(gw * gh)
-            for (y in 0 until gh) for (x in 0 until gw) {
-                if (!cur[y * gw + x]) continue
-                for (dy in -1..1) for (dx in -1..1) {
-                    val yy = y + dy
-                    val xx = x + dx
-                    if (yy in 0 until gh && xx in 0 until gw) nx[yy * gw + xx] = true
-                }
-            }
-            cur = nx
-        }
-
-        val seen = BooleanArray(gw * gh)
-        val stack = IntArray(gw * gh)
-        val minCount = (gw * gh * 0.0008f).toInt().coerceAtLeast(40)
-        var best: GemHit? = null
-        var gray: IntArray? = null
-        gemRejected = -1f
-        for (start in 0 until gw * gh) {
-            if (!cur[start] || seen[start]) continue
-            var sp = 0
-            stack[sp++] = start
-            seen[start] = true
-            var cnt = 0
-            var sx = 0L
-            var sy = 0L
-            var x0 = gw
-            var x1 = 0
-            var y0 = gh
-            var y1 = 0
-            while (sp > 0) {
-                val i = stack[--sp]
-                val x = i % gw
-                val y = i / gw
-                if (red[i]) {
-                    cnt++
-                    sx += x
-                    sy += y
-                    if (x < x0) x0 = x
-                    if (x > x1) x1 = x
-                    if (y < y0) y0 = y
-                    if (y > y1) y1 = y
-                }
-                for (dy in -1..1) for (dx in -1..1) {
-                    val yy = y + dy
-                    val xx = x + dx
-                    if (yy < 0 || yy >= gh || xx < 0 || xx >= gw) continue
-                    val j = yy * gw + xx
-                    if (cur[j] && !seen[j]) {
-                        seen[j] = true
-                        stack[sp++] = j
-                    }
-                }
-            }
-            if (cnt < minCount) continue
-            val bw = (x1 - x0 + 1).toFloat() / gw
-            val bh = (y1 - y0 + 1).toFloat() / gh
-            val fill = cnt.toFloat() / ((x1 - x0 + 1) * (y1 - y0 + 1))
-            val ratio = (bw * w) / (bh * h)
-            if (bw < 0.03f || bw > 0.25f) continue
-            if (fill < 0.10f) continue
-            if (ratio < 0.3f || ratio > 3f) continue
-            val ccx = (sx.toFloat() / cnt) * stride
-            val ccy = (sy.toFloat() / cnt) * stride
-            // cocokkan dengan gambar gem asli (bukan cuma warna)
-            if (gray == null) {
-                val sm = Bitmap.createScaledBitmap(bmp, gw, gh, true)
-                val px = IntArray(gw * gh)
-                sm.getPixels(px, 0, gw, 0, 0, gw, gh)
-                if (sm !== bmp) sm.recycle()
-                gray = IntArray(gw * gh) { k ->
-                    val c = px[k]
-                    (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
-                }
-            }
-            val gr = gray ?: continue
-            val score = gemMatch(gr, gw, gh, ccx / stride, ccy / stride, w, stride)
-            if (score < gemThreshold) {
-                if (score > gemRejected) gemRejected = score
-                continue
-            }
-            if (best == null || cnt > best.count) {
-                best = GemHit(ccx, ccy, cnt, bw, bh)
-            }
-        }
-        return best
-    }
-
-    // template matching (NCC, grayscale) di sekitar kandidat merah, beberapa skala; skor 1.0 = persis sama
-    private fun gemMatch(g: IntArray, gw: Int, gh: Int, cx: Float, cy: Float, fullW: Int, stride: Int): Float {
-        val tpl = gemTemplate ?: return 0f
-        var best = -1f
-        val mults = floatArrayOf(0.8f, 0.9f, 1.0f, 1.1f, 1.2f)
+        var bestScore = -1f
+        var bestX = 0f
+        var bestY = 0f
+        var bestSz = 0
+        val mults = floatArrayOf(0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f)
         for (m in mults) {
-            val sz = Math.round(tpl.width * m * (fullW / 2576f) / stride).coerceAtLeast(12)
-            if (sz >= gw || sz >= gh) continue
+            val sz = Math.round(tpl.width * m * (w / 2576f) / stride).coerceAtLeast(10)
+            if (sz >= gw - 2 || sz >= gh - 2) continue
             val sb = Bitmap.createScaledBitmap(tpl, sz, sz, true)
             val tp = IntArray(sz * sz)
             sb.getPixels(tp, 0, sz, 0, 0, sz, sz)
@@ -680,40 +590,35 @@ class MacroService : AccessibilityService() {
                 tn += t[k] * t[k]
             }
             if (tn < 1f) continue
-            var dy = -16
-            while (dy <= 16) {
-                var dx = -16
-                while (dx <= 16) {
-                    val x0 = (cx - sz / 2f + dx).toInt()
-                    val y0 = (cy - sz / 2f + dy).toInt()
-                    if (x0 >= 0 && y0 >= 0 && x0 + sz <= gw && y0 + sz <= gh) {
-                        var sm = 0f
-                        for (yy in 0 until sz) {
-                            val row = (y0 + yy) * gw + x0
-                            for (xx in 0 until sz) sm += g[row + xx]
-                        }
-                        val mean = sm / (sz * sz)
-                        var num = 0f
-                        var den = 0f
-                        for (yy in 0 until sz) {
-                            val row = (y0 + yy) * gw + x0
-                            for (xx in 0 until sz) {
-                                val d = g[row + xx] - mean
-                                num += d * t[yy * sz + xx]
-                                den += d * d
-                            }
-                        }
-                        if (den > 1f) {
-                            val sc = num / Math.sqrt((den * tn).toDouble()).toFloat()
-                            if (sc > best) best = sc
-                        }
+            val n = (sz * sz).toDouble()
+            for (y0 in 0..(gh - sz)) {
+                for (x0 in 0..(gw - sz)) {
+                    val s1 = sum[(y0 + sz) * iw + x0 + sz] - sum[y0 * iw + x0 + sz] -
+                        sum[(y0 + sz) * iw + x0] + sum[y0 * iw + x0]
+                    val s2 = sq[(y0 + sz) * iw + x0 + sz] - sq[y0 * iw + x0 + sz] -
+                        sq[(y0 + sz) * iw + x0] + sq[y0 * iw + x0]
+                    val den = s2 - s1.toDouble() * s1 / n
+                    if (den < 1.0) continue
+                    var num = 0f
+                    for (yy in 0 until sz) {
+                        val row = (y0 + yy) * gw + x0
+                        val trow = yy * sz
+                        for (xx in 0 until sz) num += g[row + xx] * t[trow + xx]
                     }
-                    dx += 2
+                    val score = (num / Math.sqrt(den * tn)).toFloat()
+                    if (score > bestScore) {
+                        bestScore = score
+                        bestX = (x0 + sz / 2f) * stride
+                        bestY = (y0 + sz / 2f) * stride
+                        bestSz = sz
+                    }
                 }
-                dy += 2
             }
         }
-        return best
+        gemBest = bestScore
+        if (bestScore < gemThreshold) return null
+        val bw = bestSz * stride / w.toFloat()
+        return GemHit(bestX, bestY, 0, bw, bw)
     }
 
     // geser peta satu langkah mengikuti pola spiral (1,1,2,2,3,3,... langkah per arah)
