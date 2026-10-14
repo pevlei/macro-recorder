@@ -36,7 +36,7 @@ class MacroService : AccessibilityService() {
             lines.firstOrNull { l -> words.any { l.text.equals(it, true) } }
     }
 
-    private enum class Bf { WAIT, OPEN, TAB, LEVEL, SEARCH, POPUP, TROOPS, GO, CONFIRM }
+    private enum class Bf { WAIT, OPEN, TAB, LEVEL, SEARCH, POPUP, PREP, TROOPS, GO, CONFIRM }
 
     private val speeds = floatArrayOf(0.5f, 1f, 2f, 3f)
 
@@ -677,11 +677,40 @@ class MacroService : AccessibilityService() {
                     }
                     return
                 }
-                bf = Bf.TROOPS
+                bf = Bf.PREP
                 bfTries = 0
-                bfStatus = "pilih pasukan"
+                bfStatus = "pilih waktu"
                 refreshUi()
                 tapPx(ln.cx, ln.cy) { bfSchedule(1500) }
+            }
+            Bf.PREP -> {
+                // dialog "Serangan Rally": waktu persiapan (pilihan game tetap dipakai), lalu tap RALLY kedua
+                val dialog = sc.has("persiapan") || (sc.has("5 Menit") && sc.has("10 Menit"))
+                if (dialog) {
+                    val ln = sc.exactAny("RALLY")
+                    bf = Bf.TROOPS
+                    bfTries = 0
+                    bfStatus = "pilih pasukan"
+                    refreshUi()
+                    if (ln != null) {
+                        tapPx(ln.cx, ln.cy) { bfSchedule(1500) }
+                    } else {
+                        tapFrac(sc, 0.7873f, 0.4357f) { bfSchedule(1500) }
+                    }
+                    return
+                }
+                // kalau game langsung membuka layar pilih pasukan, lewati langkah ini
+                if (sc.has("BERGERAK") || sc.has("dari kotamu")) {
+                    bf = Bf.TROOPS
+                    bfTries = 0
+                    bfSchedule(100)
+                    return
+                }
+                if (bfTries++ >= 8) {
+                    bfFail("Dialog waktu rally tidak muncul", sc)
+                } else {
+                    bfSchedule(1000)
+                }
             }
             Bf.TROOPS -> {
                 // layar pilih pasukan sudah terbuka -> pilih slot
@@ -689,6 +718,13 @@ class MacroService : AccessibilityService() {
                     bf = Bf.GO
                     bfTries = 0
                     tapFrac(sc, 0.7899f, bfSlotY[bfSlot - 1]) { bfSchedule(900) }
+                    return
+                }
+                // dialog waktu persiapan masih terbuka -> kembali ke langkah itu
+                if (sc.has("persiapan")) {
+                    bf = Bf.PREP
+                    bfTries = 0
+                    bfSchedule(500)
                     return
                 }
                 // setelah RALLY: tap tombol "Pasukan Baru" di panel antrean kanan atas
