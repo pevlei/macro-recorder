@@ -24,7 +24,7 @@ class MainActivity : Activity() {
         root.setPadding(pad, pad, pad, pad)
 
         val title = TextView(this)
-        title.text = "Macro Recorder (Beta)"
+        title.text = "Rally Bot (Beta)"
         title.textSize = 22f
         root.addView(title)
 
@@ -33,11 +33,11 @@ class MainActivity : Activity() {
         info.setPadding(0, pad / 2, 0, pad / 2)
         info.text = "Cara pakai:\n" +
             "1. Aktifkan layanan Macro Recorder di Pengaturan Aksesibilitas.\n" +
-            "2. Rally Barbarian Fort otomatis: atur Lv dengan tombol - dan +, pilih Slot pasukan 1 sampai 5 " +
-            "(isi dulu slot itu di game), lalu centang Rally BF. Buka peta game dan biarkan.\n" +
-            "3. Tombol Stop mematikan bot.\n" +
-            "4. Makro rekaman: tap Rec, pilih slot, rekam, Stop, lalu tap nama slot untuk memutar.\n\n" +
-            "Bot butuh Android 11 ke atas dan game berbahasa Indonesia. " +
+            "2. Buka game dan masuk ke peta.\n" +
+            "3. Di panel Rally Bot, atur Level fort dan Slot pasukan (isi dulu slot itu di game).\n" +
+            "4. Nyalakan saklar Rally Barbarian Fort. Bot jalan sendiri, matikan saklar untuk berhenti.\n" +
+            "5. Ikon roda gigi di panel: pengaturan kecepatan.\n\n" +
+            "Butuh Android 11 ke atas dan game berbahasa Indonesia. " +
             "Kalau tombol aksesibilitas abu-abu (Android 13+): buka Info aplikasi, " +
             "menu titik tiga, pilih Izinkan setelan terbatas."
         root.addView(info)
