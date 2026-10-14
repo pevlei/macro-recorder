@@ -33,11 +33,10 @@ class MainActivity : Activity() {
         info.setPadding(0, pad / 2, 0, pad / 2)
         info.text = "Cara pakai:\n" +
             "1. Aktifkan layanan Macro Recorder di Pengaturan Aksesibilitas.\n" +
-            "2. Buka game dan masuk ke peta.\n" +
-            "3. Di panel Rally Bot, atur Level fort dan Slot pasukan (isi dulu slot itu di game).\n" +
-            "4. Nyalakan saklar Rally Barbarian Fort. Bot jalan sendiri, matikan saklar untuk berhenti.\n" +
-            "   Atau nyalakan Farm Gems: peta digeser otomatis sampai gem deposit ketemu.\n" +
-            "5. Ikon roda gigi di panel: pengaturan kecepatan.\n\n" +
+            "2. Buka game dan masuk ke peta, lalu pilih tab Fort atau Gems di panel.\n" +
+            "3. Fort: atur Level dan Slot pasukan, lalu nyalakan saklar.\n" +
+            "4. Gems: pilih jumlah March, lalu nyalakan saklar. Bot menyapu peta dan mengambil deposit permata.\n" +
+            "5. Matikan saklar untuk berhenti. Roda gigi: pengaturan kecepatan.\n\n" +
             "Butuh Android 11 ke atas dan game berbahasa Indonesia. " +
             "Kalau tombol aksesibilitas abu-abu (Android 13+): buka Info aplikasi, " +
             "menu titik tiga, pilih Izinkan setelan terbatas."
