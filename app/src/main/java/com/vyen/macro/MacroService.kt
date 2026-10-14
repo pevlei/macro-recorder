@@ -107,6 +107,9 @@ class MacroService : AccessibilityService() {
     private lateinit var btnBf: TextView
     private lateinit var btnBfLv: TextView
     private lateinit var btnBfSlot: TextView
+    private lateinit var btnBfStop: TextView
+    private lateinit var dbgView: TextView
+    private lateinit var row1: LinearLayout
 
     // rekam
     private var recSlot = 0
@@ -200,7 +203,18 @@ class MacroService : AccessibilityService() {
         status.setTextColor(Color.WHITE)
         status.textSize = 12f
         status.setPadding(dp(8), dp(6), dp(8), dp(6))
+        status.maxLines = 2
+        status.maxWidth = dp(320)
         panelRoot.addView(status)
+
+        dbgView = TextView(this)
+        dbgView.setTextColor(0xFFB0B0B0.toInt())
+        dbgView.textSize = 9f
+        dbgView.maxLines = 3
+        dbgView.maxWidth = dp(320)
+        dbgView.setPadding(dp(8), 0, dp(8), dp(4))
+        dbgView.visibility = View.GONE
+        panelRoot.addView(dbgView)
 
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
@@ -216,6 +230,7 @@ class MacroService : AccessibilityService() {
         row.addView(btnPause)
         row.addView(btnSet)
         panelRoot.addView(row)
+        row1 = row
 
         btnLevel = chip("＋Level (tap − lalu +)", 0xFF1A73E8.toInt()) {
             if (mode == Mode.RECORDING && levelPending == 0) {
@@ -255,6 +270,9 @@ class MacroService : AccessibilityService() {
             if (mode == Mode.IDLE) bfSetOn(!bfOn) else say("Selesaikan makro dulu")
         }
         bfRow.addView(btnBf)
+        btnBfStop = chip("■ Stop", 0xFF5F6368.toInt()) { stopAll(true) }
+        btnBfStop.visibility = View.GONE
+        bfRow.addView(btnBfStop)
         panelRoot.addView(bfRow)
 
         bfCfg = LinearLayout(this)
@@ -350,6 +368,9 @@ class MacroService : AccessibilityService() {
         bfRow.visibility = if (playing || rec) View.GONE else View.VISIBLE
         bfCfg.visibility = if (playing || rec || bot) View.GONE else View.VISIBLE
         btnLevel.visibility = if (rec) View.VISIBLE else View.GONE
+        row1.visibility = if (bot) View.GONE else View.VISIBLE
+        btnBfStop.visibility = if (bot) View.VISIBLE else View.GONE
+        dbgView.visibility = if (bot) View.VISIBLE else View.GONE
         if (playing || rec || bot) settingsBox.visibility = View.GONE
         btnRec.text = if (mode == Mode.PICK) "✕ Batal" else "● Rec"
         btnStop.alpha = if (idle && !paused && !bot) 0.4f else 1f
@@ -665,6 +686,7 @@ class MacroService : AccessibilityService() {
         if (userStop) bfSetOn(false)
         token++
         handler.removeCallbacksAndMessages(null)
+        if (::panelRoot.isInitialized) panelRoot.alpha = 1f
         val wasRunning = mode == Mode.PLAYING || queue.isNotEmpty()
         if (mode == Mode.RECORDING) {
             removeCapture()
@@ -789,6 +811,7 @@ class MacroService : AccessibilityService() {
         bfOn = on
         if (on) {
             bf = Bf.WAIT
+            bfBusy = false
             bfFails = 0
             bfNull = 0
             bfCount = 0
@@ -797,12 +820,13 @@ class MacroService : AccessibilityService() {
             note = null
             refreshUi()
             // geser panel ke tepi atas supaya tidak menutupi titik tap bot
-            panelParams.x = dp(150)
+            panelParams.x = (resources.displayMetrics.widthPixels * 0.36f).toInt()
             panelParams.y = dp(2)
             try { wm.updateViewLayout(panelRoot, panelParams) } catch (e: Exception) {}
             bfSchedule(500)
         } else {
             handler.removeCallbacks(bfTask)
+            panelRoot.alpha = 1f
             bfStatus = ""
             refreshUi()
         }
@@ -813,8 +837,15 @@ class MacroService : AccessibilityService() {
         if (bfOn) handler.postDelayed(bfTask, ms)
     }
 
+    // panel disembunyikan sebentar supaya OCR tidak membaca panel sendiri / tertutup panel
     private fun readScreen(cb: (Screen?) -> Unit) {
+        panelRoot.alpha = 0f
+        handler.postDelayed({ readScreenNow(cb) }, 150L)
+    }
+
+    private fun readScreenNow(cb: (Screen?) -> Unit) {
         grab { bmp ->
+            panelRoot.alpha = 1f
             if (bmp == null) {
                 cb(null)
                 return@grab
@@ -831,13 +862,20 @@ class MacroService : AccessibilityService() {
                             if (bx != null) ls.add(Ln(l.text.trim(), bx.exactCenterX(), bx.exactCenterY()))
                         }
                     }
-                    cb(Screen(w, h, ls))
+                    val scr = Screen(w, h, ls)
+                    showDbg(scr)
+                    cb(scr)
                 }
                 .addOnFailureListener {
                     bmp.recycle()
                     cb(null)
                 }
         }
+    }
+
+    private fun showDbg(sc: Screen) {
+        val t = sc.lines.take(12).joinToString(" | ") { it.text.take(16) }
+        dbgView.text = "OCR: " + t.take(150)
     }
 
     private fun tapPx(x: Float, y: Float, done: () -> Unit) {
@@ -1082,12 +1120,21 @@ class MacroService : AccessibilityService() {
                 }
                 // setelah RALLY: tap tombol "Pasukan Baru" di panel antrean kanan atas
                 val nb = sc.exactAny("Pasukan Baru", "Pasukan", "New Troops")
+                    ?: sc.lines.firstOrNull {
+                        it.cx > sc.w * 0.7f && it.cy < sc.h * 0.3f &&
+                            it.text.contains("Pasukan", true) && !it.text.contains("Bentuk", true)
+                    }
                 if (nb != null) {
                     tapPx(nb.cx, nb.cy) { bfSchedule(1500) }
                     return
                 }
                 if (sc.has("dari kotamu")) {
                     tapFrac(sc, 0.8024f, 0.2f) { bfSchedule(1500) }
+                    return
+                }
+                if (sc.has("Antrean") && bfTries in 2..5) {
+                    bfTries++
+                    tapFrac(sc, 0.9306f, 0.1475f) { bfSchedule(1500) }
                     return
                 }
                 if (bfTries++ >= 8) {
