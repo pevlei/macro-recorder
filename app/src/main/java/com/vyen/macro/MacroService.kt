@@ -75,7 +75,7 @@ class MacroService : AccessibilityService() {
     // bot Farm Gems: geser peta (spiral) sambil cari gambar gem deposit
     private class GemHit(val cx: Float, val cy: Float, val count: Int, val bw: Float, val bh: Float)
 
-    private enum class Gm { CHECK, SCAN }
+    private enum class Gm { CHECK, SCAN, POPUP, TROOPS, SET, KEYS, GO, CONFIRM }
 
     private var gemOn = false
     private var gm = Gm.CHECK
@@ -97,6 +97,14 @@ class MacroService : AccessibilityService() {
     }
     private var gemMarker: View? = null
     private var gemRejected = -1f
+    private var gemTries = 0
+    private var gemFails = 0
+    private var gemCtrBefore = 0
+    private var gemSent = 0
+    private var gemFound = 0
+    private val gemTroops = 20000
+    private val gemDone = HashMap<String, Long>()
+    private var gemCurKey: String? = null
     private var gemW = 0
     private var gemH = 0
 
@@ -393,7 +401,7 @@ class MacroService : AccessibilityService() {
                 roundBg(if (speedIdx == i) 0xFF2F6BFF.toInt() else 0xFF2B2F36.toInt(), 12)
         }
         status.text = note ?: if (bot) "$bfCount rally · $bfStatus"
-            else if (gem) "$gemSteps geseran · $gemStatus"
+            else if (gem) "$gemSent farm · $gemSteps geseran · $gemStatus"
             else "Siap. Atur level lalu nyalakan."
     }
 
@@ -418,6 +426,12 @@ class MacroService : AccessibilityService() {
             gemLegLen = 1
             gemLegDone = 0
             gemLegsAtLen = 0
+            gemTries = 0
+            gemFails = 0
+            gemSent = 0
+            gemFound = 0
+            gemCurKey = null
+            gemDone.clear()
             gemStatus = "mulai"
             note = null
             gemHideMarker()
@@ -489,9 +503,11 @@ class MacroService : AccessibilityService() {
                 gemNull = 0
                 if (hit != null) {
                     gemHideMarker()
-                    gemShowMarker(hit)
-                    val n = gemSteps
-                    gemStop("Gem deposit KETEMU (geseran ke-$n). Cek lingkaran merah di layar.")
+                    gm = Gm.POPUP
+                    gemTries = 0
+                    gemStatus = "cek deposit"
+                    refreshUi()
+                    tapPx(hit.cx, hit.cy) { gemSchedule(1300) }
                     return@gemShot
                 }
                 if (gemSteps >= gemMaxSteps) {
@@ -502,6 +518,17 @@ class MacroService : AccessibilityService() {
                     dbgView.text = "Ada merah tapi bukan gem (skor " + String.format("%.2f", gemRejected) + ")"
                 }
                 gemMove()
+            }
+            else -> readScreen { sc ->
+                gemBusy = false
+                if (!gemOn) return@readScreen
+                if (sc == null) {
+                    if (++gemNull >= 5) gemStop("Screenshot gagal, game mungkin memblokir")
+                    else gemSchedule(1000)
+                    return@readScreen
+                }
+                gemNull = 0
+                gemAct(sc)
             }
         }
     }
@@ -796,6 +823,214 @@ class MacroService : AccessibilityService() {
         try { wm.removeView(v) } catch (e: Exception) {}
     }
 
+    // ---------- Alur farm gems: popup -> kumpulkan -> pasukan baru -> isi 20000 -> bergerak ----------
+
+    private fun keyFrac(d: Char): FloatArray = when (d) {
+        '1' -> floatArrayOf(0.6657f, 0.3633f)
+        '2' -> floatArrayOf(0.7108f, 0.3633f)
+        '3' -> floatArrayOf(0.7558f, 0.3633f)
+        '4' -> floatArrayOf(0.6657f, 0.4495f)
+        '5' -> floatArrayOf(0.7108f, 0.4495f)
+        '6' -> floatArrayOf(0.7558f, 0.4495f)
+        '7' -> floatArrayOf(0.6657f, 0.5358f)
+        '8' -> floatArrayOf(0.7108f, 0.5358f)
+        '9' -> floatArrayOf(0.7558f, 0.5358f)
+        else -> floatArrayOf(0.6883f, 0.6238f)
+    }
+
+    private fun gemFail(msg: String, sc: Screen?) {
+        gemFails++
+        if (sc != null && !mapVisible(sc) &&
+            (sc.has("BERGERAK") || sc.has("Konfirmasi") || sc.exactAny("KUMPULKAN") != null)
+        ) {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+        if (gemFails >= 3) {
+            gemStop("Gems berhenti: $msg")
+            return
+        }
+        gm = Gm.CHECK
+        gemWait = 0
+        gemStatus = "gagal ($gemFails/3): $msg"
+        refreshUi()
+        gemSchedule(4000)
+    }
+
+    private fun gemAct(sc: Screen) {
+        when (gm) {
+            Gm.POPUP -> {
+                val reGem = Regex("(?i)gem\\s*deposit")
+                val gemLn = sc.lines.firstOrNull { reGem.containsMatchIn(it.text) }
+                if (gemLn == null) {
+                    if (gemTries++ >= 2) {
+                        gm = Gm.SCAN
+                        gemMove()
+                    } else {
+                        gemSchedule(800)
+                    }
+                    return
+                }
+                val lvl = Regex("(?i)level\\s*(\\d+)").find(gemLn.text)?.groupValues?.get(1)?.toInt() ?: 0
+                var px = -1
+                var py = -1
+                val rx = Regex("(?i)x\\s*:\\s*(\\d{2,4})")
+                val ry = Regex("(?i)y\\s*:\\s*(\\d{2,4})")
+                for (l in sc.lines) {
+                    if (l.cy > sc.h * 0.12f) {
+                        val mx = rx.find(l.text)
+                        val my = ry.find(l.text)
+                        if (mx != null) px = mx.groupValues[1].toInt()
+                        if (my != null) py = my.groupValues[1].toInt()
+                    }
+                }
+                val key: String? = if (px >= 0 && py >= 0) "$px:$py" else null
+                val kump = sc.exactAny("KUMPULKAN", "GATHER")
+                    ?: sc.lines.firstOrNull { it.text.length <= 14 && it.text.contains("KUMPUL", true) }
+                val last: Long? = if (key != null) gemDone[key] else null
+                val fresh = last == null || System.currentTimeMillis() - last > 45 * 60 * 1000L
+                gemFound++
+                if (kump != null && fresh) {
+                    gemCurKey = key
+                    gemCtrBefore = counterOf(sc)?.first ?: 0
+                    gm = Gm.TROOPS
+                    gemTries = 0
+                    gemStatus = "ambil permata L$lvl"
+                    refreshUi()
+                    tapPx(kump.cx, kump.cy) { gemSchedule(1500) }
+                    return
+                }
+                gemStatus = if (kump != null) "sudah dikerjakan" else "dipakai orang lain"
+                refreshUi()
+                gm = Gm.SCAN
+                gemMove()
+            }
+            Gm.TROOPS -> {
+                if (sc.has("BERGERAK") || sc.has("March")) {
+                    gm = Gm.SET
+                    gemTries = 0
+                    gemSchedule(100)
+                    return
+                }
+                val nb = sc.exactAny("Pasukan Baru", "Pasukan", "New Troops")
+                    ?: sc.lines.firstOrNull {
+                        it.cx > sc.w * 0.7f && it.cy < sc.h * 0.3f &&
+                            it.text.contains("Pasukan", true) && !it.text.contains("Bentuk", true)
+                    }
+                if (nb != null) {
+                    tapPx(nb.cx, nb.cy) { gemSchedule(1500) }
+                    return
+                }
+                if (sc.has("dari kotamu") || sc.has("Antrean")) {
+                    if (gemTries >= 8) {
+                        gemFail("Layar pasukan tidak muncul", sc)
+                        return
+                    }
+                    val direct = gemTries % 2 == 0
+                    gemTries++
+                    if (direct) {
+                        tapFrac(sc, 0.8024f, 0.2f) { gemSchedule(1500) }
+                    } else {
+                        tapFrac(sc, 0.9306f, 0.1475f) {
+                            handler.postDelayed({
+                                if (gemOn) tapFrac(sc, 0.8024f, 0.2f) { gemSchedule(1500) }
+                            }, 800L)
+                        }
+                    }
+                    return
+                }
+                if (gemTries++ >= 8) {
+                    gemFail("Layar pasukan tidak muncul", sc)
+                } else {
+                    gemSchedule(1000)
+                }
+            }
+            Gm.SET -> {
+                // tap angka jumlah pasukan baris pertama supaya numpad terbuka
+                if (sc.has("Konfirmasi")) {
+                    gm = Gm.KEYS
+                    gemSchedule(100)
+                    return
+                }
+                if (!sc.has("BERGERAK")) {
+                    if (gemTries++ >= 6) {
+                        gemFail("Layar pasukan hilang", sc)
+                    } else {
+                        gemSchedule(800)
+                    }
+                    return
+                }
+                if (gemTries++ >= 5) {
+                    gemFail("Numpad tidak terbuka", sc)
+                    return
+                }
+                tapFrac(sc, 0.733f, 0.2304f) { gemSchedule(1200) }
+            }
+            Gm.KEYS -> {
+                val pts = ArrayList<FloatArray>()
+                for (n in 0 until 8) pts.add(floatArrayOf(sc.w * 0.8004f, sc.h * 0.5358f))
+                for (c in gemTroops.toString()) {
+                    val k = keyFrac(c)
+                    pts.add(floatArrayOf(sc.w * k[0], sc.h * k[1]))
+                }
+                pts.add(floatArrayOf(sc.w * 0.7783f, sc.h * 0.6238f))
+                gm = Gm.GO
+                gemTries = 0
+                gemStatus = "isi pasukan"
+                refreshUi()
+                tapSeq(pts, 0) { gemSchedule(900) }
+            }
+            Gm.GO -> {
+                if (sc.has("Konfirmasi")) {
+                    if (gemTries++ >= 4) {
+                        gemFail("Numpad tidak tertutup", sc)
+                        return
+                    }
+                    tapFrac(sc, 0.7783f, 0.6238f) { gemSchedule(800) }
+                    return
+                }
+                val ln = sc.find("BERGERAK")
+                if (ln == null) {
+                    if (gemTries++ >= 4) {
+                        gemFail("Tombol kirim pasukan hilang", sc)
+                    } else {
+                        gemSchedule(800)
+                    }
+                    return
+                }
+                gm = Gm.CONFIRM
+                gemTries = 0
+                gemStatus = "kirim pasukan"
+                refreshUi()
+                tapPx(ln.cx, ln.cy) { gemSchedule(1800) }
+            }
+            Gm.CONFIRM -> {
+                val ctrNow = counterOf(sc)
+                val now = ctrNow?.first ?: 0
+                // counter terbaca: harus naik; tidak terbaca: cukup peta kembali dan layar pasukan hilang (2x cek)
+                val departed = mapVisible(sc) && !sc.has("BERGERAK") &&
+                    (if (ctrNow != null) now > gemCtrBefore else gemTries >= 1)
+                if (departed) {
+                    gemSent++
+                    gemFails = 0
+                    val k = gemCurKey
+                    if (k != null) gemDone[k] = System.currentTimeMillis()
+                    gemSteps = 0
+                    gemStatus = "farm terkirim"
+                    refreshUi()
+                    gm = Gm.SCAN
+                    gemMove()
+                    return
+                }
+                if (gemTries++ >= 8) {
+                    gemFail("Pasukan tidak berangkat", sc)
+                } else {
+                    gemSchedule(1000)
+                }
+            }
+            else -> {}
+        }
+    }
+
     // ---------- Bot Rally Barbarian Fort ----------
 
     private fun bfSetOn(on: Boolean) {
@@ -929,7 +1164,7 @@ class MacroService : AccessibilityService() {
     }
 
     private fun tapSeq(pts: List<FloatArray>, i: Int, done: () -> Unit) {
-        if (!bfOn) return
+        if (!bfOn && !gemOn) return
         if (i >= pts.size) {
             done()
             return
